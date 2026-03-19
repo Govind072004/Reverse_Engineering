@@ -1,0 +1,880 @@
+
+
+
+
+# import os
+# import re
+# import json
+# import time
+# from datetime import datetime
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# import pandas as pd
+# from serpapi import GoogleSearch
+# from dotenv import load_dotenv
+
+# from api_rotating_claude import get_serpapi_key
+# from logger import logger
+# BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+# _env_path = os.path.join(BASE_DIR, ".env")
+# if os.path.exists(_env_path):
+#     load_dotenv(_env_path)
+
+
+# def _step_log(step: str, message: str, emoji: str = "▶"):
+#     ts = datetime.now().strftime("%H:%M:%S")
+#     print(f"[{ts}]  {step:<8}  {emoji}  {message}")
+
+
+# CACHE_FOLDER = os.path.join(BASE_DIR, "research_cache")
+
+
+
+# def _normalize_company_name(name: str) -> str:
+#     import unicodedata
+#     name = unicodedata.normalize("NFKD", name)
+#     name = name.encode("ascii", "ignore").decode("ascii")
+#     name = "".join(c for c in name if c.isalnum() or c in "._- ")
+#     name = name.strip().replace(" ", "_").lower()
+#     name = re.sub(r"_+", "_", name)
+#     return name
+
+
+# def _get_search_name(row) -> str:
+#     """
+#     Agar company naam corrupt hai (IPA™ → IPAâ„¢),
+#     toh website domain se search naam nikalo.
+#     Normal names ke liye original naam return karo.
+#     """
+#     company = str(row.get("Company Name", "")).strip()
+
+#     is_corrupt = (
+#         any(ord(c) > 127 for c in company) or
+#         'â'   in company or
+#         'Ã'   in company or
+#         'â„¢' in company
+#     )
+
+#     if is_corrupt:
+#         website = str(row.get("Website", "")).strip()
+#         if website and website.lower() not in ("nan", "none", ""):
+#             domain = re.sub(r'https?://(www\.)?', '', website)
+#             domain = domain.split('.')[0].split('/')[0].lower().strip()
+#             if domain and len(domain) > 2:
+#                 return domain
+
+#     return company
+
+# def _cache_path(company_name: str) -> str:
+#     safe = _normalize_company_name(company_name)
+#     return os.path.join(CACHE_FOLDER, f"{safe}.json")
+
+
+
+
+# def load_local_cache() -> set:
+#     _step_log("STEP 2", "Loading cached names from local research_cache folder...")
+#     try:
+#         if not os.path.exists(CACHE_FOLDER):
+#             _step_log("STEP 2", "Cache folder not found — starting fresh.", "⚠️")
+#             return set()
+#         cached = set()
+#         for fname in os.listdir(CACHE_FOLDER):
+#             if fname.endswith(".json"):
+#                 try:
+#                     with open(os.path.join(CACHE_FOLDER, fname), "r", encoding="utf-8") as f:
+#                         data = json.load(f)
+#                     # name = data.get("company", "").strip().lower()
+#                     # if name:
+#                     #     cached.add(name)
+#                     name = data.get("company", "").strip()
+#                     if name:
+#                         cached.add(_normalize_company_name(name))
+#                 except Exception:
+#                     pass
+#         _step_log("STEP 2", f"Local cache loaded: {len(cached)} companies already researched.", "✅")
+#         return cached
+#     except Exception as e:
+#         _step_log("STEP 2", f"Cache read error — continuing without cache. Error: {e}", "⚠️")
+#         return set()
+
+
+# def get_company_from_cache(company_name: str) -> dict | None:
+#     path = _cache_path(company_name)
+#     if not os.path.exists(path):
+#         return None
+#     try:
+#         with open(path, "r", encoding="utf-8") as f:
+#             return json.load(f)
+#     except Exception:
+#         return None
+
+
+# def save_company_to_cache(company_data: dict) -> None:
+#     name = company_data.get("company", "").strip()
+#     if not name:
+#         return
+#     os.makedirs(CACHE_FOLDER, exist_ok=True)
+#     path = _cache_path(name)
+#     try:
+#         with open(path, "w", encoding="utf-8") as f:
+#             json.dump(company_data, f, indent=4, ensure_ascii=False)
+#     except Exception as e:
+#         _step_log("CACHE", f"Failed to save cache for {name}: {e}", "⚠️")
+
+
+# def _repair_json(raw_text: str) -> list:
+#     if not raw_text or not raw_text.strip():
+#         return []
+
+#     cleaned = raw_text.strip()
+
+#     try:
+#         return json.loads(cleaned)
+#     except json.JSONDecodeError:
+#         pass
+
+#     try:
+#         fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+#         return json.loads(fixed)
+#     except json.JSONDecodeError:
+#         pass
+
+#     try:
+#         from json_repair import repair_json
+#         repaired = repair_json(cleaned)
+#         result   = json.loads(repaired)
+#         if isinstance(result, list):
+#             _step_log("PARSE", "JSON repaired successfully using json-repair library.", "🔧")
+#             return result
+#     except (ImportError, Exception):
+#         pass
+
+#     _step_log("PARSE", f"All JSON repair attempts failed. Raw text preview: {cleaned[:200]}...", "❌")
+#     return []
+
+
+# def _parse_serpapi_response(response: dict) -> list:
+#     text_blocks = response.get("text_blocks", [])
+#     full_text   = ""
+#     for block in text_blocks:
+#         full_text += block.get("snippet", "") + block.get("code", "")
+
+#     match = re.search(r'\[.*\]', full_text, re.DOTALL)
+#     if match:
+#         return _repair_json(match.group(0).strip())
+
+#     _step_log("PARSE", "No JSON array [...] found anywhere in SerpAPI response.", "⚠️")
+#     return []
+
+
+# def _fetch_one_batch(batch: list, batch_label: str) -> list:
+#     company_text = ", ".join(batch)
+#     _step_log("STEP 3", f"{batch_label} → Fetching {len(batch)} companies via SerpAPI...", "🔍")
+
+#     prompt = f"""
+# Act as a structured business research engine.
+# For each company listed below, return STRICT JSON only.
+# Do NOT add any commentary, markdown, preamble, or explanation.
+# Keep each company entry under 120 words total.
+
+# Return format — a JSON array, nothing else:
+# [
+#   {{
+#     "company": "Exact Company Name",
+#     "pain_points": [
+#       "Specific business pain point 1",
+#       "Specific business pain point 2",
+#       "Specific business pain point 3"
+#     ],
+#     "recent_news": [
+#       {{"title": "News headline", "source": "Source name"}},
+#       {{"title": "News headline", "source": "Source name"}}
+#     ]
+#   }}
+# ]
+
+# Companies to research:
+# {company_text}
+# """
+
+#     params = {
+#         "engine":  "google_ai_mode",
+#         "q":       prompt,
+#         "api_key": get_serpapi_key(),
+#         "hl":      "en",
+#         "gl":      "us",
+#     }
+
+#     try:
+#         response     = GoogleSearch(params).get_dict()
+#         company_list = _parse_serpapi_response(response)
+#         _step_log("STEP 3", f"{batch_label} → Returned {len(company_list)}/{len(batch)} companies.", "✅")
+#         return company_list
+#     except Exception as e:
+#         _step_log("STEP 3", f"{batch_label} → SerpAPI fetch failed: {e}", "❌")
+#         return []
+
+
+# def _hand_to_email_pipeline(company_list: list, batch_label: str, email_callback) -> None:
+#     if not company_list:
+#         return
+#     if email_callback is None:
+#         _step_log("EMAIL", f"{batch_label} → No email callback set — research-only mode.", "⚠️")
+#         return
+#     _step_log("EMAIL", f"{batch_label} → Handing {len(company_list)} companies to Email Creation.", "📧")
+#     try:
+#         email_callback(company_list)
+#         _step_log("EMAIL", f"{batch_label} → Email Creation handoff complete.", "✅")
+#     except Exception as e:
+#         _step_log("EMAIL", f"{batch_label} → Email Creation callback raised error: {e}", "❌")
+
+
+# def run_serpapi_research(
+#     df,
+#     email_callback            = None,
+#     output_folder: str        = "structured_company_data",
+#     batch_size: int           = 10,
+#     max_parallel_fetches: int = 2,
+#     max_email_workers: int    = 4,
+# ) -> dict:
+
+#     _step_log("STEP 1", "Extracting unique company names from uploaded sheet...")
+
+#     # raw_names     = df["Company Name"].astype(str).str.strip().dropna().tolist()
+#     # unique_set    = {name for name in raw_names if name and name.lower() != "nan"}
+#     # all_companies = sorted(unique_set)
+
+#     raw_names  = df["Company Name"].astype(str).str.strip().dropna().tolist()
+#     unique_set = {name for name in raw_names if name and name.lower() != "nan"}
+
+#     # Corrupt names ko domain se replace karo BEFORE SerpAPI search
+#     all_companies_clean = []
+#     for name in sorted(unique_set):
+#         # df mein us company ki row dhundho
+#         mask = df["Company Name"].astype(str).str.strip() == name
+#         if mask.any() and "Website" in df.columns:
+#             row = df[mask].iloc[0]
+#             search_name = _get_search_name(row)  # corrupt → domain, normal → same
+#         else:
+#             search_name = name
+#         all_companies_clean.append(search_name)
+
+#     all_companies = all_companies_clean
+
+#     _step_log("STEP 1", f"Found {len(raw_names)} rows → {len(all_companies)} unique after deduplication.", "✅")
+
+#     cached_names = load_local_cache()
+
+#     companies_to_fetch  = []
+#     cached_company_data = []
+#     skipped_count       = 0
+
+#     for company in all_companies:
+#         # if company.strip().lower() in cached_names:
+#         if _normalize_company_name(company) in cached_names:
+#             skipped_count += 1
+#             data = get_company_from_cache(company)
+#             if data:
+#                 cached_company_data.append(data)
+#         else:
+#             companies_to_fetch.append(company)
+
+#     _step_log(
+#         "STEP 1",
+#         f"Pipeline summary → Total: {len(all_companies)} | "
+#         f"Already cached (skip SerpAPI): {skipped_count} | "
+#         f"To fetch now: {len(companies_to_fetch)}",
+#         "📊"
+#     )
+
+#     session_data = {}
+
+#     if email_callback and cached_company_data:
+#         _step_log("STEP 2", f"Sending {len(cached_company_data)} cached companies to email pipeline...")
+#         with ThreadPoolExecutor(max_workers=max_email_workers) as cached_email_executor:
+#             for i in range(0, len(cached_company_data), batch_size):
+#                 batch = cached_company_data[i : i + batch_size]
+#                 cached_email_executor.submit(
+#                     _hand_to_email_pipeline,
+#                     batch,
+#                     f"Cache-Batch {i // batch_size + 1}",
+#                     email_callback,
+#                 )
+#         for d in cached_company_data:
+#             name = d.get("company", "").strip()
+#             if name:
+#                 session_data[name.lower()] = {
+#                     "pain_points": d.get("pain_points", []),
+#                     "recent_news": d.get("recent_news",  []),
+#                 }
+
+#     if not companies_to_fetch:
+#         _step_log("STEP 1", "All companies already cached. Zero SerpAPI credits used.", "✅")
+#         return session_data
+
+#     total_batches = -(-len(companies_to_fetch) // batch_size)
+
+#     _step_log("STEP 3", f"Starting parallel pipeline — {len(companies_to_fetch)} companies | {total_batches} batches.")
+#     _step_log("STEP 3", f"FETCH POOL: {max_parallel_fetches} threads | EMAIL POOL: {max_email_workers} threads (separate).")
+
+#     with ThreadPoolExecutor(max_workers=max_parallel_fetches) as fetch_executor, \
+#          ThreadPoolExecutor(max_workers=max_email_workers)    as email_executor:
+
+#         fetch_futures = {}
+#         for i in range(0, len(companies_to_fetch), batch_size):
+#             batch       = companies_to_fetch[i : i + batch_size]
+#             batch_num   = i // batch_size + 1
+#             batch_label = f"Batch {batch_num}/{total_batches}"
+#             future = fetch_executor.submit(_fetch_one_batch, batch, batch_label)
+#             fetch_futures[future] = batch_label
+
+#         for future in as_completed(fetch_futures):
+#             batch_label  = fetch_futures[future]
+#             company_list = future.result()
+
+#             if not company_list:
+#                 _step_log("STEP 3", f"{batch_label} → No data returned. Skipping.", "⚠️")
+#                 continue
+
+#             # for company_data in company_list:
+#             #     save_company_to_cache(company_data)
+#             #     name = company_data.get("company", "").strip()
+
+#             for company_data in company_list:
+#                 # SerpAPI ne jo naam return kiya use search naam se override karo
+#                 # Taaki "IPA (thinkipa.com)" → "thinkipa" rahe cache mein
+#                 serpapi_returned_name = company_data.get("company", "").strip()
+#                 # Original search naam dhundho — jo humne bheja tha
+#                 for search_name in companies_to_fetch:
+#                     if _normalize_company_name(search_name) in _normalize_company_name(serpapi_returned_name) or \
+#                        _normalize_company_name(serpapi_returned_name) in _normalize_company_name(search_name):
+#                         company_data["company"] = search_name
+#                         break
+#                 save_company_to_cache(company_data)
+#                 name = company_data.get("company", "").strip()
+#                 if name:
+#                     session_data[name.lower()] = {
+#                         "pain_points": company_data.get("pain_points", []),
+#                         "recent_news": company_data.get("recent_news",  []),
+#                     }
+
+#             email_executor.submit(
+#                 _hand_to_email_pipeline,
+#                 company_list,
+#                 batch_label,
+#                 email_callback,
+#             )
+
+#         _step_log("EMAIL", "Waiting for all email creation tasks to complete...")
+
+#     _step_log("DONE", f"Pipeline complete. {len(session_data)} companies processed.", "🎉")
+#     return session_data
+
+
+# def run_single_company_research(company_name: str, email_callback=None, output_folder: str = "structured_company_data") -> dict | None:
+#     _step_log("TEST", f"Single company mode: '{company_name}'")
+
+#     cached = load_local_cache()
+#     if company_name.strip().lower() in cached:
+#         _step_log("TEST", "Already in local cache — no SerpAPI call needed.", "⏩")
+#         existing = get_company_from_cache(company_name)
+#         if existing:
+#             _step_log("TEST", f"Existing data:\n{json.dumps(existing, indent=2)}", "📋")
+#         return existing
+
+#     company_list = _fetch_one_batch([company_name], "Test 1/1")
+
+#     if not company_list:
+#         _step_log("TEST", "No data returned from SerpAPI.", "❌")
+#         return None
+
+#     for data in company_list:
+#         save_company_to_cache(data)
+#         _step_log("TEST", f"Fetched & cached:\n{json.dumps(data, indent=2)}", "✅")
+
+#     if email_callback:
+#         _hand_to_email_pipeline(company_list, "Test 1/1", email_callback)
+
+#     return company_list[0] if company_list else None
+
+
+# # if __name__ == "__main__":
+# #     target_company = "AnavClouds Software Solutions"
+# #     run_single_company_research(target_company)
+
+# if __name__ == "__main__":
+
+#     # ── Add up to 10 companies here ──────────────────────────────────────
+#     target_companies = [
+#         "AnavClouds Software Solutions",
+#         "Metacube",
+#         "Fractal",
+#         "kugalbliz",
+#         "L&T Infotech",
+#         "Figma",
+#         "Linear",
+#         "Retool",
+#         "Vercel",
+#         "A3 Logics",
+#     ]
+#     # ─────────────────────────────────────────────────────────────────────
+
+#     # Wrap list into a DataFrame so run_serpapi_research accepts it
+#     df = pd.DataFrame({"Company Name": target_companies})
+
+#     results = run_serpapi_research(df, email_callback=None)
+
+#     print("\n" + "="*55)
+#     print(f"  Done. {len(results)} companies processed.")
+#     print("="*55)
+#     for name, data in results.items():
+#         print(f"\n  {name}")
+#         print(f"    pain_points : {len(data['pain_points'])}")
+#         print(f"    recent_news : {len(data['recent_news'])}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+import re
+import json
+import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+from serpapi import GoogleSearch
+from dotenv import load_dotenv
+
+from api_rotating_claude import get_serpapi_key
+from logger import logger                              # LOG CHANGE: imported logger
+
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+_env_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(_env_path):
+    load_dotenv(_env_path)
+
+
+# LOG CHANGE: _step_log function removed
+# It only printed to terminal — never saved to file
+# logger handles both terminal + file automatically
+
+
+CACHE_FOLDER = os.path.join(BASE_DIR, "research_cache")
+
+
+def _normalize_company_name(name: str) -> str:
+    import unicodedata
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = "".join(c for c in name if c.isalnum() or c in "._- ")
+    name = name.strip().replace(" ", "_").lower()
+    name = re.sub(r"_+", "_", name)
+    return name
+
+
+def _get_search_name(row) -> str:
+    """
+    If company name is corrupt (IPA™ → IPAâ„¢),
+    extract search name from website domain instead.
+    For normal names return original name as-is.
+    """
+    company = str(row.get("Company Name", "")).strip()
+
+    is_corrupt = (
+        any(ord(c) > 127 for c in company) or
+        'â'   in company or
+        'Ã'   in company or
+        'â„¢' in company
+    )
+
+    if is_corrupt:
+        website = str(row.get("Website", "")).strip()
+        if website and website.lower() not in ("nan", "none", ""):
+            domain = re.sub(r'https?://(www\.)?', '', website)
+            domain = domain.split('.')[0].split('/')[0].lower().strip()
+            if domain and len(domain) > 2:
+                return domain
+
+    return company
+
+
+def _cache_path(company_name: str) -> str:
+    safe = _normalize_company_name(company_name)
+    return os.path.join(CACHE_FOLDER, f"{safe}.json")
+
+
+def cleanup_old_cache(days: int = 30):
+    """Delete research_cache files older than 30 days."""
+    if not os.path.exists(CACHE_FOLDER):
+        return
+    import time
+    now     = time.time()
+    cutoff  = days * 86400
+    deleted = 0
+    for fname in os.listdir(CACHE_FOLDER):
+        if not fname.endswith(".json"):
+            continue
+        fpath = os.path.join(CACHE_FOLDER, fname)
+        if (now - os.path.getmtime(fpath)) > cutoff:
+            os.remove(fpath)
+            deleted += 1
+    if deleted:
+        logger.info(f"[CACHE] Cleanup done — {deleted} files older than {days} days deleted")
+
+
+def load_local_cache() -> set:
+    logger.info("[CACHE] Loading research_cache folder...")          # LOG CHANGE: _step_log → logger.info (normal progress)
+    try:
+        if not os.path.exists(CACHE_FOLDER):
+            logger.warning("[CACHE] Cache folder not found — starting fresh")   # LOG CHANGE: ⚠️ → logger.warning
+            return set()
+        cached = set()
+        for fname in os.listdir(CACHE_FOLDER):
+            if fname.endswith(".json"):
+                try:
+                    with open(os.path.join(CACHE_FOLDER, fname), "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    name = data.get("company", "").strip()
+                    if name:
+                        cached.add(_normalize_company_name(name))
+                except Exception:
+                    pass                                             # LOG CHANGE: no log here on purpose
+                                                                     # 1 corrupt file silently skipped
+                                                                     # logging here = 1000 warning lines for 1000 companies
+        logger.info(f"[CACHE] Loaded {len(cached)} companies from cache")       # LOG CHANGE: ✅ → logger.info
+        return cached
+    except Exception as e:
+        logger.warning(f"[CACHE] Read error — starting fresh | {e}")            # LOG CHANGE: ⚠️ → logger.warning (pipeline continues)
+        return set()
+
+
+def get_company_from_cache(company_name: str) -> dict | None:
+    path = _cache_path(company_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None                                                  # LOG CHANGE: no log here on purpose
+                                                                     # called in a loop — 1 missing file is expected, not an error
+
+
+def save_company_to_cache(company_data: dict) -> None:
+    name = company_data.get("company", "").strip()
+    if not name:
+        return
+    os.makedirs(CACHE_FOLDER, exist_ok=True)
+    path = _cache_path(name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(company_data, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"[CACHE] Failed to save {name} | {e}")      # LOG CHANGE: ⚠️ → logger.warning (pipeline continues without this file)
+
+
+def _repair_json(raw_text: str) -> list:
+    if not raw_text or not raw_text.strip():
+        return []
+
+    cleaned = raw_text.strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        fixed = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(cleaned)
+        result   = json.loads(repaired)
+        if isinstance(result, list):
+            logger.info("[PARSE] JSON repaired successfully using json-repair library")  # LOG CHANGE: 🔧 → logger.info (it worked, not a warning)
+            return result
+    except (ImportError, Exception):
+        pass
+
+    logger.error(f"[PARSE] All JSON repair attempts failed | preview: {cleaned[:200]}")  # LOG CHANGE: ❌ → logger.error (data lost for this batch)
+    return []
+
+
+def _parse_serpapi_response(response: dict) -> list:
+    text_blocks = response.get("text_blocks", [])
+    full_text   = ""
+    for block in text_blocks:
+        full_text += block.get("snippet", "") + block.get("code", "")
+
+    match = re.search(r'\[.*\]', full_text, re.DOTALL)
+    if match:
+        return _repair_json(match.group(0).strip())
+
+    logger.warning("[PARSE] No JSON array found in SerpAPI response")           # LOG CHANGE: ⚠️ → logger.warning (response came but no data)
+    return []
+
+
+def _fetch_one_batch(batch: list, batch_label: str) -> list:
+    company_text = ", ".join(batch)
+    logger.info(f"[SERPAPI] {batch_label} → Fetching {len(batch)} companies")   # LOG CHANGE: 🔍 _step_log → logger.info (normal start)
+
+    prompt = f"""
+Act as a structured business research engine.
+For each company listed below, return STRICT JSON only.
+Do NOT add any commentary, markdown, preamble, or explanation.
+Keep each company entry under 120 words total.
+
+Return format — a JSON array, nothing else:
+[
+  {{
+    "company": "Exact Company Name",
+    "pain_points": [
+      "Specific business pain point 1",
+      "Specific business pain point 2",
+      "Specific business pain point 3"
+    ],
+    "recent_news": [
+      {{"title": "News headline", "source": "Source name"}},
+      {{"title": "News headline", "source": "Source name"}}
+    ]
+  }}
+]
+
+Companies to research:
+{company_text}
+"""
+
+    params = {
+        "engine":  "google_ai_mode",
+        "q":       prompt,
+        "api_key": get_serpapi_key(),
+        "hl":      "en",
+        "gl":      "us",
+    }
+
+    try:
+        response     = GoogleSearch(params).get_dict()
+        company_list = _parse_serpapi_response(response)
+        logger.info(f"[SERPAPI] {batch_label} → Done {len(company_list)}/{len(batch)} companies")  # LOG CHANGE: ✅ → logger.info
+        return company_list
+    except Exception as e:
+        logger.error(f"[SERPAPI] {batch_label} → Fetch failed | {e}")           # LOG CHANGE: ❌ → logger.error (entire batch lost)
+        return []
+
+
+def _hand_to_email_pipeline(company_list: list, batch_label: str, email_callback) -> None:
+    if not company_list:
+        return
+    if email_callback is None:
+        logger.warning(f"[EMAIL] {batch_label} → No callback set — research-only mode")  # LOG CHANGE: ⚠️ → logger.warning
+        return
+    logger.info(f"[EMAIL] {batch_label} → Sending {len(company_list)} companies to email pipeline")  # LOG CHANGE: 📧 → logger.info
+    try:
+        email_callback(company_list)
+        logger.info(f"[EMAIL] {batch_label} → Handoff complete")                # LOG CHANGE: ✅ → logger.info
+    except Exception as e:
+        logger.error(f"[EMAIL] {batch_label} → Callback error | {e}")           # LOG CHANGE: ❌ → logger.error (emails lost for this batch)
+
+
+def run_serpapi_research(
+    df,
+    email_callback            = None,
+    output_folder: str        = "structured_company_data",
+    batch_size: int           = 10,
+    max_parallel_fetches: int = 2,
+    max_email_workers: int    = 4,
+) -> dict:
+    
+    cleanup_old_cache(days=30)
+    logger.info("[PIPELINE] Extracting unique company names from uploaded sheet")  # LOG CHANGE: _step_log → logger.info
+
+    raw_names  = df["Company Name"].astype(str).str.strip().dropna().tolist()
+    unique_set = {name for name in raw_names if name and name.lower() != "nan"}
+
+    # Corrupt names replace with domain name BEFORE SerpAPI search
+    all_companies_clean = []
+    for name in sorted(unique_set):
+        mask = df["Company Name"].astype(str).str.strip() == name
+        if mask.any() and "Website" in df.columns:
+            row = df[mask].iloc[0]
+            search_name = _get_search_name(row)
+        else:
+            search_name = name
+        all_companies_clean.append(search_name)
+
+    all_companies = all_companies_clean
+
+    logger.info(f"[PIPELINE] {len(raw_names)} rows → {len(all_companies)} unique companies after dedup")  # LOG CHANGE: ✅ → logger.info
+
+    cached_names = load_local_cache()
+
+    companies_to_fetch  = []
+    cached_company_data = []
+    skipped_count       = 0
+
+    for company in all_companies:
+        if _normalize_company_name(company) in cached_names:
+            skipped_count += 1
+            data = get_company_from_cache(company)
+            if data:
+                cached_company_data.append(data)
+        else:
+            companies_to_fetch.append(company)
+
+    logger.info(                                                                  # LOG CHANGE: 📊 _step_log → logger.info (summary, not warning)
+        f"[PIPELINE] Total: {len(all_companies)} | "
+        f"Cached (skip SerpAPI): {skipped_count} | "
+        f"To fetch: {len(companies_to_fetch)}"
+    )
+
+    session_data = {}
+
+    if email_callback and cached_company_data:
+        logger.info(f"[PIPELINE] Sending {len(cached_company_data)} cached companies to email pipeline")  # LOG CHANGE: _step_log → logger.info
+        with ThreadPoolExecutor(max_workers=max_email_workers) as cached_email_executor:
+            for i in range(0, len(cached_company_data), batch_size):
+                batch = cached_company_data[i : i + batch_size]
+                cached_email_executor.submit(
+                    _hand_to_email_pipeline,
+                    batch,
+                    f"Cache-Batch {i // batch_size + 1}",
+                    email_callback,
+                )
+        for d in cached_company_data:
+            name = d.get("company", "").strip()
+            if name:
+                session_data[name.lower()] = {
+                    "pain_points": d.get("pain_points", []),
+                    "recent_news": d.get("recent_news",  []),
+                }
+
+    if not companies_to_fetch:
+        logger.info("[PIPELINE] All companies already cached — zero SerpAPI credits used")  # LOG CHANGE: ✅ → logger.info
+        return session_data
+
+    total_batches = -(-len(companies_to_fetch) // batch_size)
+
+    logger.info(f"[PIPELINE] Starting fetch — {len(companies_to_fetch)} companies | {total_batches} batches")  # LOG CHANGE: _step_log → logger.info
+    logger.info(f"[PIPELINE] Fetch workers: {max_parallel_fetches} | Email workers: {max_email_workers}")      # LOG CHANGE: _step_log → logger.info
+
+    with ThreadPoolExecutor(max_workers=max_parallel_fetches) as fetch_executor, \
+         ThreadPoolExecutor(max_workers=max_email_workers)    as email_executor:
+
+        fetch_futures = {}
+        for i in range(0, len(companies_to_fetch), batch_size):
+            batch       = companies_to_fetch[i : i + batch_size]
+            batch_num   = i // batch_size + 1
+            batch_label = f"Batch {batch_num}/{total_batches}"
+            future = fetch_executor.submit(_fetch_one_batch, batch, batch_label)
+            fetch_futures[future] = batch_label
+
+        for future in as_completed(fetch_futures):
+            batch_label  = fetch_futures[future]
+            company_list = future.result()
+
+            if not company_list:
+                logger.warning(f"[SERPAPI] {batch_label} → No data returned — skipping")  # LOG CHANGE: ⚠️ → logger.warning (batch lost, pipeline continues)
+                continue
+
+            for company_data in company_list:
+                serpapi_returned_name = company_data.get("company", "").strip()
+                for search_name in companies_to_fetch:
+                    if _normalize_company_name(search_name) in _normalize_company_name(serpapi_returned_name) or \
+                       _normalize_company_name(serpapi_returned_name) in _normalize_company_name(search_name):
+                        company_data["company"] = search_name
+                        break
+                save_company_to_cache(company_data)
+                name = company_data.get("company", "").strip()
+                if name:
+                    session_data[name.lower()] = {
+                        "pain_points": company_data.get("pain_points", []),
+                        "recent_news": company_data.get("recent_news",  []),
+                    }
+
+            email_executor.submit(
+                _hand_to_email_pipeline,
+                company_list,
+                batch_label,
+                email_callback,
+            )
+
+        logger.info("[EMAIL] Waiting for all email creation tasks to complete")  # LOG CHANGE: _step_log → logger.info
+
+    logger.info(f"[PIPELINE] Complete — {len(session_data)} companies processed")  # LOG CHANGE: 🎉 → logger.info
+    return session_data
+
+
+def run_single_company_research(company_name: str, email_callback=None, output_folder: str = "structured_company_data") -> dict | None:
+    logger.info(f"[TEST] Single company mode: '{company_name}'")                 # LOG CHANGE: _step_log → logger.info
+
+    cached = load_local_cache()
+    if company_name.strip().lower() in cached:
+        logger.info(f"[TEST] '{company_name}' already cached — no SerpAPI call needed")  # LOG CHANGE: ⏩ → logger.info
+        existing = get_company_from_cache(company_name)
+        if existing:
+            logger.info(f"[TEST] Existing data: {json.dumps(existing, indent=2)}")       # LOG CHANGE: 📋 → logger.info
+        return existing
+
+    company_list = _fetch_one_batch([company_name], "Test 1/1")
+
+    if not company_list:
+        logger.error(f"[TEST] No data returned from SerpAPI for '{company_name}'")  # LOG CHANGE: ❌ → logger.error (test failed)
+        return None
+
+    for data in company_list:
+        save_company_to_cache(data)
+        logger.info(f"[TEST] Fetched and cached: {json.dumps(data, indent=2)}")  # LOG CHANGE: ✅ → logger.info
+
+    if email_callback:
+        _hand_to_email_pipeline(company_list, "Test 1/1", email_callback)
+
+    return company_list[0] if company_list else None
+
+
+if __name__ == "__main__":
+
+    # Add up to 10 companies here
+    target_companies = [
+        "AnavClouds Software Solutions",
+        "Metacube",
+        "Fractal",
+        "kugalbliz",
+        "L&T Infotech",
+        "Figma",
+        "Linear",
+        "Retool",
+        "Vercel",
+        "A3 Logics",
+    ]
+
+    # Wrap list into a DataFrame so run_serpapi_research accepts it
+    df = pd.DataFrame({"Company Name": target_companies})
+
+    results = run_serpapi_research(df, email_callback=None)
+
+    print("\n" + "="*55)
+    print(f"  Done. {len(results)} companies processed.")
+    print("="*55)
+    for name, data in results.items():
+        print(f"\n  {name}")
+        print(f"    pain_points : {len(data['pain_points'])}")
+        print(f"    recent_news : {len(data['recent_news'])}")
