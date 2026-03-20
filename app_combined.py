@@ -1,8 +1,6 @@
 
 
 
-
-
 import streamlit as st
 import pandas as pd
 import os
@@ -46,6 +44,8 @@ if "uploaded_df"       not in st.session_state: st.session_state.uploaded_df    
 if "final_csv_clean"   not in st.session_state: st.session_state.final_csv_clean   = None
 if "total_rows"        not in st.session_state: st.session_state.total_rows        = 0   # METRICS: total rows in uploaded file
 if "unique_companies"  not in st.session_state: st.session_state.unique_companies  = 0   # METRICS: unique company names
+# LAYER 2+3: partial results — saved after every batch so crash never loses data
+if "partial_csv_data"  not in st.session_state: st.session_state.partial_csv_data  = None
 
 
 # ==============================================================================
@@ -250,7 +250,64 @@ def _make_email_callback(df: pd.DataFrame, service_focus: str, results_store: di
                     if _normalize_name(map_val) == lookup_key:
                         results_store[map_key] = email_data
 
+            # LAYER 2: After every batch — save partial results immediately
+            # So if pipeline crashes later, all completed emails are already safe
+            try:
+                _save_partial_results(df, results_store, _make_email_callback._result_holder)
+            except Exception:
+                pass  # Partial save failure must never stop the main pipeline
+
     return callback
+
+
+# ==============================================================================
+# LAYER 2: PARTIAL RESULTS SAVER
+# Builds a CSV from whatever emails have been generated so far
+# Called after every batch — crash-safe because data is saved incrementally
+# ==============================================================================
+
+def _save_partial_results(df: pd.DataFrame, results_store: dict, result_holder: dict) -> None:
+    """Saves whatever emails have been generated so far into result_holder['partial']."""
+    try:
+        partial_df = df.copy()
+        partial_df["Email_subject"] = ""
+        partial_df["Email_Body"]    = ""
+        partial_df["AI_Source"]     = ""
+
+        for idx, row in partial_df.iterrows():
+            csv_name    = str(row.get("Company Name", "")).strip()
+            norm_key    = _normalize_name(csv_name)
+            domain_key  = _normalize_name(_get_search_name(row))
+
+            if domain_key != norm_key and domain_key in results_store:
+                matched_key = domain_key
+            else:
+                matched_key = _fuzzy_match(norm_key, results_store)
+
+            if matched_key:
+                partial_df.at[idx, "Email_subject"] = results_store[matched_key].get("Email_subject", "")
+                partial_df.at[idx, "Email_Body"]    = results_store[matched_key].get("Email_Body",    "")
+                partial_df.at[idx, "AI_Source"]     = results_store[matched_key].get("AI_Source",     "")
+
+        cols = ["First Name", "Last Name", "Company Name", "Email", "Industry", "Email_subject", "Email_Body"]
+        for col in cols:
+            if col not in partial_df.columns:
+                partial_df[col] = ""
+
+        partial_df = partial_df[cols].copy()
+        partial_df["Email_Body"] = partial_df.apply(inject_first_name, axis=1)
+
+        # Only rows where email was actually generated
+        clean_partial = partial_df[
+            partial_df["Email_subject"].notna() &
+            (partial_df["Email_subject"].astype(str).str.strip() != "")
+        ].copy()
+
+        result_holder["partial"] = clean_partial.to_csv(index=False).encode("utf-8-sig")
+        logger.info(f"[PARTIAL SAVE] {len(clean_partial)} emails saved so far")
+
+    except Exception as e:
+        logger.warning(f"[PARTIAL SAVE] Failed to save partial: {e}")
 
 
 # ==============================================================================
@@ -260,6 +317,9 @@ def _make_email_callback(df: pd.DataFrame, service_focus: str, results_store: di
 def _run_full_pipeline(df: pd.DataFrame, service_choice: str, results_store: dict, result_holder: dict) -> None:
     try:
         logger.info(f"[PIPELINE] Started — {len(df)} rows | service: {service_choice}")  # LOG CHANGE: added pipeline start log
+
+        # LAYER 2: Attach result_holder to callback function so partial save works
+        _make_email_callback._result_holder = result_holder
 
         run_serpapi_research(
             df=df,
@@ -315,6 +375,11 @@ def _run_full_pipeline(df: pd.DataFrame, service_choice: str, results_store: dic
     except Exception as e:
         import traceback
         logger.error(f"[PIPELINE] Crashed — {e}")                             # LOG CHANGE: added pipeline crash log
+        # LAYER 3: Save whatever was built before the crash
+        try:
+            _save_partial_results(df, results_store, result_holder)
+        except Exception:
+            pass
         result_holder["error"] = str(e) + "\n" + traceback.format_exc()
 
 
@@ -329,6 +394,16 @@ def main():
 
     if st.session_state.pipeline_error:
         st.error(f"❌ An error occurred: {st.session_state.pipeline_error}")
+        # LAYER 3: Show partial download button when pipeline crashes
+        if st.session_state.partial_csv_data is not None:
+            st.warning("⚠️ Pipeline crashed — but emails that were generated before the crash are available below!")
+            st.download_button(
+                label     = "🆘 Download Partial Results (emails generated before crash)",
+                data      = st.session_state.partial_csv_data,
+                file_name = "Partial_Results_before_crash.csv",
+                mime      = "text/csv",
+                type      = "primary",
+            )
 
     st.markdown("### 📥 Step 1: Upload Company Data")
     uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
@@ -349,6 +424,27 @@ def main():
         if "Company Name" not in df_temp.columns:
             st.error("❌ The uploaded file MUST contain a 'Company Name' column.")
             st.stop()
+
+        # LAYER 1: Pre-flight validation — drop rows missing Company Name, First Name, or Email
+        # These rows would crash the pipeline or produce useless blank emails anyway
+        REQUIRED_COLS = ["Company Name", "First Name", "Email"]
+        before_drop = len(df_temp)
+        for col in REQUIRED_COLS:
+            if col in df_temp.columns:
+                df_temp = df_temp[
+                    df_temp[col].notna() &
+                    (df_temp[col].astype(str).str.strip() != "") &
+                    (df_temp[col].astype(str).str.lower() != "nan")
+                ]
+        df_temp = df_temp.reset_index(drop=True)
+        dropped_count = before_drop - len(df_temp)
+        if dropped_count > 0:
+            logger.warning(f"[UPLOAD] {dropped_count} row(s) dropped — missing Company Name / First Name / Email")
+            st.warning(
+                f"⚠️ {dropped_count} row(s) removed before pipeline — "
+                f"Company Name, First Name, or Email was blank. "
+                f"Remaining rows: {len(df_temp)}"
+            )
 
         # METRICS: save to session state so they persist across reruns
         st.session_state.uploaded_df      = df_temp
@@ -397,6 +493,8 @@ def main():
             st.session_state.result_holder_ref = result_holder
             st.session_state.pipeline_running  = True
             st.session_state.pipeline_error    = None
+            # LAYER 3: Reset partial data on new run
+            st.session_state.partial_csv_data  = None
 
             threading.Thread(
                 target=_run_full_pipeline,
@@ -412,6 +510,10 @@ def main():
         if "error" in result_holder:
             st.session_state.pipeline_error   = result_holder["error"]
             st.session_state.pipeline_running = False
+            # LAYER 3: Capture partial CSV into session state before rerun
+            if "partial" in result_holder:
+                st.session_state.partial_csv_data = result_holder["partial"]
+                logger.info("[LAYER 3] Partial results captured into session state after crash")
             st.rerun()
 
         elif "done" in result_holder:
@@ -439,7 +541,11 @@ def main():
             st.session_state.final_df_preview["Email_subject"].isna() |
             (st.session_state.final_df_preview["Email_subject"].astype(str).str.strip() == "")
         )
-        failed_companies = st.session_state.final_df_preview[blank_mask]["Company Name"].unique().tolist()
+        # BUGFIX: Convert to str and filter out NaN/float values before join
+        failed_companies = [
+            str(c) for c in st.session_state.final_df_preview[blank_mask]["Company Name"].unique().tolist()
+            if c == c and str(c).strip() not in ("", "nan", "None")
+        ]
         if failed_companies:
             st.warning(
                 f"⚠️ **{len(failed_companies)} company email(s) could not be generated:** "
